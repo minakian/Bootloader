@@ -111,11 +111,46 @@ int bootload(){
       Serial.println("Error: " + String(parseAndFlashRow(i), HEX));
     }
   }
+  // Verify Application checksum
+  char data[] = {0x01, 0x31, 0, 0, 0xCE, 0xFF, 0x17};
+  sendCommand(dev_address, 7, data);
+  delay(10);
+  getResponse(dev_address, 32);
+  // Exit Bootloader
+  char data_2[] = {0x01, 0x3B, 0, 0, 0xC4, 0xFF, 0x17};
+  sendCommand(dev_address, 7, data);
   return 0;
 }
 
 int parseAndFlashRow(int row){
-  
+  char array_id = cyacd_file[row][0];
+  int row_number = cyacd_file[row][1];
+  row_number <<= 8; 
+  row_number |= cyacd_file[row][2];
+  int data_length = cyacd_file[row][3];
+  data_length <<= 8;
+  data_length |= cyacd_file[row][4];
+  int chunk_size = 0x19;
+  for(int i = 0; i < (data_length - chunk_size); i = i + chunk_size){
+    int status = sendData(chunk_size, &cyacd_file[row][i+5]);
+    if(status != 0){
+      Serial.println("Parse and Flash Row Error: " + String(status, HEX));
+    }
+  }
+  int last_chunk_size = data_length % chunk_size;
+  //Serial.println("Last Chunk Size" + String(last_chunk_size));
+  int last_chunk_start = 5 + data_length - last_chunk_size;
+  int status = programRow(array_id, row_number, last_chunk_size, &cyacd_file[row][last_chunk_start]);
+  if(status != 0){
+    Serial.println("Program Row Error: " + String(status, HEX));
+  }
+  status = verifyRow(array_id, row_number, cyacd_file[row][4+data_length]);
+  if(status != 0){
+    Serial.println("Verify Row Error: " + String(status, HEX));
+  }
+
+  return 0;
+
 }
 
 int sendCommand(char address, int data_len, char * data){
@@ -166,21 +201,27 @@ int findStartLocation(){
 int verifyChecksum(){
   int checksum = 0;
   int start = findStartLocation();
+  //Serial.println("Start location: " + String(start, HEX));
   int length = receive_buffer[start + 3];
   length <<= 8;
   length |= receive_buffer[start + 2];
+  //Serial.println("Length: " + String(length, HEX));
   for(int i = start; i < start + length + 4; i++){
     checksum += receive_buffer[i];
+    //Serial.println(String(receive_buffer[i], HEX) + " " + String(checksum, HEX));
   }
-  int rx_checksum = receive_buffer[start + length + 6];
+  checksum = ~checksum;
+  checksum += 1;
+  checksum &= (0xFFFF);
+  //Serial.println("CHECKSUM: " + String(checksum, HEX));
+  int rx_checksum = receive_buffer[start + length + 5];
   rx_checksum <<= 8;
-  rx_checksum |= receive_buffer[start + length + 5];
+  rx_checksum |= receive_buffer[start + length + 4];
   if(rx_checksum != checksum){
+    //Serial.println("Checksum Fail: " + String(rx_checksum, HEX) + " vs " + String(checksum, DEC));
     return -1;
   }
   return 0;
-
-
 }
 
 int getFlashSize(){
@@ -244,7 +285,8 @@ int sendData(int data_len, char * data){
   transmit_buffer[position++] = (char) (checksum & 0xFF);
   transmit_buffer[position++] = (char) (checksum >> 8) & 0xFF;
   transmit_buffer[position] = 0x17;
-  sendCommand(dev_address, position, transmit_buffer);
+  sendCommand(dev_address, (position + 1), transmit_buffer);
+  delay(10);
   getResponse(dev_address, 32);
   int check = verifyChecksum();
   if(check){
@@ -296,24 +338,29 @@ int enterBootloader(){
 }
 
 int programRow(int array_id, int row_number, int data_len, char* data){
-  int checksum = 0x01;
-  int position = 3;
+  int checksum = 0x00;
+  int position = 10;
+  data_len += 3;
   transmit_buffer[0] = START_BYTE;
   transmit_buffer[1] = CMD_PROGRAM_ROW;
-  checksum += transmit_buffer[1];
   transmit_buffer[2] = (char) (data_len & 0xFF);
-  checksum += transmit_buffer[2];
   transmit_buffer[3] = (char) ((data_len >> 8) & 0xFF);
-  checksum += transmit_buffer[3];
+  transmit_buffer[4] = array_id;
+  transmit_buffer[5] = (char)row_number;
+  row_number >>= 8;
+  transmit_buffer[6] = (char)row_number;
   for(int i = 0; i < data_len; i++){
-    transmit_buffer[4 + i] = data[i];
-    checksum += data[i];
+    transmit_buffer[7 + i] = data[i];
+  }
+  for(int i = 0; i < 10; i++){
+    checksum += transmit_buffer[i];
   }
   checksum = (~checksum) + 1;
   transmit_buffer[position++] = (char) (checksum & 0xFF);
-  transmit_buffer[position++] = (char) (checksum >> 8) & 0xFF;
-  transmit_buffer[position] = 0x17;
+  transmit_buffer[position++] = (char) ((checksum >> 8) & 0xFF);
+  transmit_buffer[position++] = 0x17;
   sendCommand(dev_address, position, transmit_buffer);
+  delay(10);
   getResponse(dev_address, 32);
   int check = verifyChecksum();
   if(check){
@@ -325,9 +372,24 @@ int programRow(int array_id, int row_number, int data_len, char* data){
 }
 
 int verifyRow(char array_id, int row_number, char row_check){
-  int checksum = START_BYTE + CMD_VERIFY_ROW + 0x03 + 0x00 + array_id + (row_number % 0xff) + (row_number >> 8);
-  char data[] = {START_BYTE, CMD_VERIFY_ROW, 0x03, 0x00, array_id, (char) (row_number % 0xff), (char) (row_number >> 8), (char)(checksum & 0xff), (char)((checksum >> 8) & 0xFF), END_BYTE};
+  int checksum = 0;
+  char data[] = {START_BYTE, CMD_VERIFY_ROW, 0x03, 0x00, array_id, (char) (row_number % 0xff), (char) (row_number >> 8), 0, 0, END_BYTE};
+  for(int i = 0; i < 7; i++){
+    checksum += data[i];
+  }
+  int check_2 = 0;
+  for(int i = 0; i < 134; i++){
+    check_2 += cyacd_file[1][i];
+  }
+  check_2 = ~check_2;
+  check_2 += 1;
+//  Serial.println("Check 2: " + String((check_2 & 0xFF), HEX));
+  checksum = ~checksum;
+  checksum += 1;
+  data[7] = (char)(checksum & 0xFF);
+  data[8] = (char)((checksum >> 8) & 0xff);
   sendCommand(dev_address, 10, data);
+  delay(10);
   getResponse(dev_address,32);
   int check = verifyChecksum();
   if(check){
@@ -339,6 +401,7 @@ int verifyRow(char array_id, int row_number, char row_check){
     return status;
   }
   if(row_check != receive_buffer[start + 4]){
+  //  Serial.println(String(row_check, HEX) + " vs " + String(receive_buffer[start+4], HEX));
     return -2;
   }
   return 0;
